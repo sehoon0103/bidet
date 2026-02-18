@@ -23,6 +23,14 @@ ATmega328P(Arduino UNO)에서 **AVR 레지스터 기반 C**로 키패드/시트�
 - Circuit PDF: `비데.pdf`
 - Keymap Image: `keymap.PNG`
 - Wiring / Setup Image: `상태default.PNG`
+- ## Screenshots
+
+(1) DEFAULT
+![DEFAULT](assets/default.png)
+
+(2) Seat ON / Nozzle Lv2 / Pressure Lv1 / Seat Heat Lv2
+![Seat ON](assets/seat_nozzle2_pressure1_heat2.png)
+
 
 ---
 
