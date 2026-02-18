@@ -512,10 +512,9 @@ void keypad_matrix_input(void) {
             if (rising & (1 << col)) {
                 char key_char = key_map[row][col];
               
-                if (key_char == '4') { // 노즐위치 후진
+                if (key_char == '4') { 
                     if (seat_sensor 
-                        && sequence_active 
-                        && (current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK)) {
+                        && (current_state == STATE_IDLE || current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK)) {
                         tone_on();
                         PORTB |=  (1<<PB0);
                         PORTD &= ~(1<<PD7);
@@ -536,10 +535,9 @@ void keypad_matrix_input(void) {
                     }
                       		
                   }
-                } else if (key_char == '5') { // 노즐위치 전진
-                    if (seat_sensor 
-                        && sequence_active 
-                        && (current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK)) {
+                } else if (key_char == '5') {
+                    if (seat_sensor  
+                        && (current_state == STATE_IDLE || current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK)) {
                         tone_on();
                         PORTB |=  (1<<PB7);
                         PORTD &= ~(1<<PD0);                      
@@ -559,7 +557,7 @@ void keypad_matrix_input(void) {
                         uart_print_key("5", "nozzle phase + (3)");
                     }
                   }
-                } else if (key_char == '7') { // 수압감소
+                } else if (key_char == '7') {
                   if (!dry_mode_active && seat_sensor) {
                     tone_on();
                     if (led_get(0, 0) && led_get(0, 1) && led_get(0, 2)) {
@@ -574,7 +572,7 @@ void keypad_matrix_input(void) {
                         uart_print_key("7", "water pressure - (1)");
                     }
                   }
-                } else if (key_char == '8') { // 수압증가
+                } else if (key_char == '8') {
                   if (!dry_mode_active && seat_sensor) {
                     tone_on();
                     if (led_get(0, 0) && led_get(0, 1)) {
@@ -589,7 +587,7 @@ void keypad_matrix_input(void) {
                         uart_print_key("8", "water pressure + (3)");
                     }
                   }
-                } else if (key_char == 'B') { //시트 온도
+                } else if (key_char == 'B') {
                   if (!dry_mode_active) {               
                     tone_on();
                     if (led_get(1, 0) && led_get(1, 1) && led_get(1, 2)) {
@@ -612,7 +610,7 @@ void keypad_matrix_input(void) {
                         seat_temperature = 1;
                     }
                   }
-                } else if (key_char == 'A') { //건조
+                } else if (key_char == 'A') {
                   if (!dry_mode_active && seat_sensor) {
                     uart_print_key("A", "dry");
                     tone_on();
@@ -622,13 +620,13 @@ void keypad_matrix_input(void) {
                     dry_mode_active = 1;
                     dry_mode_start_time = millis(); 
                   }
-                } else if (key_char == '1') { //정지
+                } else if (key_char == '1') {
                   if (seat_sensor) {
                     uart_print_key("1", "STOP");
                     tone_on();
                     stop(); 
                   }
-                } else if (key_char == '2')  { //세정
+                } else if (key_char == '2')  {//세훈추가
                   if (seat_sensor && current_state==STATE_IDLE) {
                     tone_on();
                     uart_print_key("2", "wash start");
@@ -637,7 +635,7 @@ void keypad_matrix_input(void) {
                     current_nozzle_back_time = nozzle_back_time_wash;
                     enter_state(STATE_NOZZLE_FORWARD);
                   }  
-                } else if (key_char == '3') { //비데
+                } else if (key_char == '3') {//세훈추가
                   if (seat_sensor && current_state==STATE_IDLE) {
                     tone_on();
                     uart_print_key("3", "bidet start");
@@ -650,6 +648,7 @@ void keypad_matrix_input(void) {
 
               
   else if (key_char == '*') {		// 디버깅용 * 눌렀을 때 수압, 시트온도, 노즐위치, 시트센터상태 표시
+  uart_print_key("*", "debug");		// 디버깅용
   tone_on();						// 디버깅용
   debug_status();  // 상태 출력		// 디버깅용
   }									// 디버깅용
