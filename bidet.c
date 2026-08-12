@@ -14,10 +14,13 @@ typedef enum {
   STATE_DRY,
 } BidetState; 
 
-volatile BidetState current_state = STATE_IDLE; 
+volatile BidetState current_state = STATE_IDLE;
 volatile uint32_t state_start_time = 0;
 void enter_state(BidetState s);
 void update_state(void);
+uint32_t millis(void);
+void tone_stop(void);
+void debug_status(void);
 
 volatile uint8_t blink_inc_active = 0;
 volatile uint8_t blink_dec_active = 0;
