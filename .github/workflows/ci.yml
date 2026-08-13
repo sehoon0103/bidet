@@ -15,3 +15,5 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-avr avr-libc
       - name: Compile
         run: avr-gcc -mmcu=atmega328p -Os -Wall -c bidet.c -o bidet.o
+      - name: MISRA-style static analysis
+        run: cppcheck --addon=misra --enable=all --error-exitcode=1 bidet.c
