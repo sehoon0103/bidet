@@ -228,6 +228,21 @@ void uart_print_key_P(const char* keyname_P, const char* label_P) {
     uart_transmit('\n');
 }
 
+// "[키이름] 동작설명 (단계)" 형태로 출력 (예: "[7] water pressure - (2)")
+// level은 1~9 사이 한 자리 숫자만 쓴다고 가정 (여기서는 항상 1~3단계)
+void uart_print_key_level_P(const char* keyname_P, const char* label_P, uint8_t level) {
+    uart_transmit('[');
+    uart_print_P(keyname_P);
+    uart_transmit(']');
+    uart_transmit(' ');
+    uart_print_P(label_P);
+    uart_transmit(' ');
+    uart_transmit('(');
+    uart_transmit('0' + level);   // 숫자를 문자로 변환 (예: 2 -> '2')
+    uart_transmit(')');
+    uart_transmit('\n');
+}
+
 // -------------------------------------------------------------------------------------------
 
 // led 매트릭스, 키패드 매트릭스 함수
@@ -311,6 +326,41 @@ void led_set(uint8_t row, uint8_t col, uint8_t on) {
 uint8_t led_get(uint8_t row, uint8_t col) {
     if (row > 3 || col > 3) return 0;
     return !(led_pattern[row] & (1 << (3 - col)));
+}
+
+// 누적 막대(bar) 방식 3단계 LED 증가/감소 (수압처럼 1단계=●, 2단계=●●, 3단계=●●●)
+// level: 갱신할 변수의 주소(포인터). 함수 안에서 *level 값을 직접 바꿔준다.
+// row: LED 매트릭스에서 이 게이지가 있는 행 번호
+// increase: 1이면 증가, 0이면 감소
+static void bar_level_change(uint8_t *level, uint8_t row, uint8_t increase) {
+    if (increase) {
+        if (*level < 3) {
+            (*level)++;
+            led_set(row, *level - 1, 1);   // 새로 채워진 칸만 켜면 됨
+        }
+    } else {
+        if (*level > 1) {
+            led_set(row, *level - 1, 0);   // 제일 끝 칸만 끄면 됨
+            (*level)--;
+        }
+    }
+}
+
+// 단일 점(dot) 방식 3단계 LED 증가/감소 (노즐위치처럼 항상 LED 1개만 켜져서 단계를 표시)
+static void dot_level_change(uint8_t *level, uint8_t row, uint8_t increase) {
+    if (increase) {
+        if (*level < 3) {
+            led_set(row, *level - 1, 0);   // 이전 위치 끄기
+            (*level)++;
+            led_set(row, *level - 1, 1);   // 새 위치 켜기
+        }
+    } else {
+        if (*level > 1) {
+            led_set(row, *level - 1, 0);
+            (*level)--;
+            led_set(row, *level - 1, 1);
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -549,19 +599,8 @@ void keypad_matrix_input(void) {
                         buzzer_start();
                         if (current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK) {
                             start_dec_blink();
-                            if (led_get(2, 2)) {
-                                uart_print_key_P(PSTR("4"), PSTR("nozzle phase - (2)"));
-                                led_set(2, 2, 0);
-                                led_set(2, 1, 1);
-                                nozzle_phase = 2;
-                            } else if (led_get(2, 1)) {
-                                uart_print_key_P(PSTR("4"), PSTR("nozzle phase - (1)"));
-                                led_set(2, 1, 0);
-                                led_set(2, 0, 1);
-                                nozzle_phase = 1;
-                            } else {
-                                uart_print_key_P(PSTR("4"), PSTR("nozzle phase - (1)"));
-                            }
+                            dot_level_change(&nozzle_phase, 2, 0);
+                            uart_print_key_level_P(PSTR("4"), PSTR("nozzle phase -"), nozzle_phase);
                         }
                     }
                 } else if (key_char == '5') {   // 노즐 위치 + (높은 단계로)
@@ -569,53 +608,24 @@ void keypad_matrix_input(void) {
                         buzzer_start();
                         if (current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK) {
                             start_inc_blink();
-                            if (led_get(2, 1)) {
-                                uart_print_key_P(PSTR("5"), PSTR("nozzle phase + (3)"));
-                                led_set(2, 1, 0);
-                                led_set(2, 2, 1);
-                                nozzle_phase = 3;
-                            } else if (led_get(2, 0)) {
-                                uart_print_key_P(PSTR("5"), PSTR("nozzle phase + (2)"));
-                                led_set(2, 0, 0);
-                                led_set(2, 1, 1);
-                                nozzle_phase = 2;
-                            } else {
-                                uart_print_key_P(PSTR("5"), PSTR("nozzle phase + (3)"));
-                            }
+                            dot_level_change(&nozzle_phase, 2, 1);
+                            uart_print_key_level_P(PSTR("5"), PSTR("nozzle phase +"), nozzle_phase);
                         }
                     }
                 } else if (key_char == '7') {   // 수압 -
                     if (seat_sensor) {
                         buzzer_start();
                         if (!dry_mode_active) {
-                            if (led_get(0, 0) && led_get(0, 1) && led_get(0, 2)) {
-                                uart_print_key_P(PSTR("7"), PSTR("water pressure - (2)"));
-                                led_set(0, 2, 0);
-                                water_pressure = 2;
-                            } else if (led_get(0, 0) && led_get(0, 1)) {
-                                uart_print_key_P(PSTR("7"), PSTR("water pressure - (1)"));
-                                led_set(0, 1, 0);
-                                water_pressure = 1;
-                            } else {
-                                uart_print_key_P(PSTR("7"), PSTR("water pressure - (1)"));
-                            }
+                            bar_level_change(&water_pressure, 0, 0);
+                            uart_print_key_level_P(PSTR("7"), PSTR("water pressure -"), water_pressure);
                         }
                     }
                 } else if (key_char == '8') {   // 수압 +
                     if (seat_sensor) {
                         buzzer_start();
                         if (!dry_mode_active) {
-                            if (led_get(0, 0) && led_get(0, 1)) {
-                                uart_print_key_P(PSTR("8"), PSTR("water pressure + (3)"));
-                                led_set(0, 2, 1);
-                                water_pressure = 3;
-                            } else if (led_get(0, 0)) {
-                                uart_print_key_P(PSTR("8"), PSTR("water pressure + (2)"));
-                                led_set(0, 1, 1);
-                                water_pressure = 2;
-                            } else {
-                                uart_print_key_P(PSTR("8"), PSTR("water pressure + (3)"));
-                            }
+                            bar_level_change(&water_pressure, 0, 1);
+                            uart_print_key_level_P(PSTR("8"), PSTR("water pressure +"), water_pressure);
                         }
                     }
                 } else if (key_char == 'B') {   // 시트 온도 단계 순환 (시트센서와 무관하게 항상 동작)
