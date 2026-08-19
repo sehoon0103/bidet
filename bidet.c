@@ -1,248 +1,254 @@
-#define F_CPU 16000000UL
-#include <avr/io.h>
-#include <util/delay.h>
-#include <stdio.h>
-#include <avr/interrupt.h>
-#include <util/atomic.h>
+#define F_CPU 16000000UL           // CPU 동작 주파수(16MHz) - 시간 계산에 쓰임
+#include <avr/io.h>                 // PORTB, DDRC 같은 레지스터 이름을 쓰기 위한 헤더
+#include <util/delay.h>             // _delay_ms(), _delay_us() 같은 짧은 대기 함수
+#include <stdio.h>                  // snprintf_P 등 문자열 포맷 함수
+#include <avr/interrupt.h>          // ISR(인터럽트 서비스 루틴), sei()/cli()
+#include <util/atomic.h>            // ATOMIC_BLOCK: 인터럽트 도중 값이 바뀌지 않게 보호
+#include <avr/pgmspace.h>           // PROGMEM, PSTR, pgm_read_* : 데이터를 RAM 대신 플래시에 저장
 
-typedef enum { 
-  STATE_IDLE,
-  STATE_NOZZLE_FORWARD,
-  STATE_PUMP_ON,
-  STATE_NOZZLE_BACK,
-  STATE_PUMP_WEAK,
-  STATE_DRY,
-} BidetState; 
+// 비데가 세정 중 거치는 단계들. 순서대로
+// 대기 -> 노즐 전진 -> 강하게 세정 -> 노즐 복귀 -> 약하게 헹굼 -> 건조 -> (다시 대기)
+typedef enum {
+  STATE_IDLE,            // 대기 상태
+  STATE_NOZZLE_FORWARD,  // 노즐이 앞으로 나가는 중
+  STATE_PUMP_ON,         // 설정한 수압으로 세정 중 (5초)
+  STATE_NOZZLE_BACK,     // 노즐이 원위치로 들어가는 중
+  STATE_PUMP_WEAK,       // 약한 수압으로 헹굼 (1초)
+  STATE_DRY,             // 건조팬 동작 (3초)
+} BidetState;
 
-volatile BidetState current_state = STATE_IDLE;
-volatile uint32_t state_start_time = 0;
-void enter_state(BidetState s);
-void update_state(void);
-uint32_t millis(void);
-void tone_stop(void);
-void debug_status(void);
+volatile BidetState current_state = STATE_IDLE;  // 지금 어떤 단계인지
+volatile uint32_t state_start_time = 0;          // 현재 단계에 들어온 시각(ms) - 경과시간 계산용
+void enter_state(BidetState s);   // 상태를 바꿔주는 함수 (아래에서 정의)
+void update_state(void);          // 매 루프마다 상태를 갱신하는 함수 (아래에서 정의)
 
-volatile uint8_t blink_inc_active = 0;
-volatile uint8_t blink_dec_active = 0;
-uint32_t blink_inc_start = 0;
-uint32_t blink_dec_start = 0;
+// 아래쪽에서 정의되지만 더 앞에서 쓰이므로 전방 선언(원형만 미리 알려줌) 필요
+// (없으면 암묵적 함수 선언으로 처리되어 32비트 반환값이 16비트로 잘릴 수 있음)
+uint32_t millis_custom(void);   // 전원 켜진 뒤 지난 시간(ms)을 알려주는 함수
+uint32_t micros_custom(void);   // 전원 켜진 뒤 지난 시간(us, 더 정밀함)을 알려주는 함수
+void fan_on(void);                // 건조팬 켜기
+void fan_off(void);               // 건조팬 끄기
+
+// 노즐 위치를 4/5번 키로 바꿀 때, LED를 100ms만 반짝였다가 자동으로 꺼서
+// "지금 바뀌었다"는 걸 눈으로 보여주기 위한 타이머 (delay 없이 동작)
+volatile uint8_t blink_inc_active = 0;  // 증가(PD7) LED가 지금 깜빡이는 중인지
+volatile uint8_t blink_dec_active = 0;  // 감소(PB0) LED가 지금 깜빡이는 중인지
+uint32_t blink_inc_start = 0;           // 증가 LED가 켜진 시각(ms)
+uint32_t blink_dec_start = 0;           // 감소 LED가 켜진 시각(ms)
+
+// 증가 LED를 켜고 100ms 타이머 시작
 static inline void start_inc_blink(void) {
     blink_inc_active   = 1;
-    blink_inc_start    = millis();
+    blink_inc_start    = millis_custom();
     PORTD |=  (1<<PD7);    // 증가 LED ON
 }
+// 감소 LED를 켜고 100ms 타이머 시작
 static inline void start_dec_blink(void) {
     blink_dec_active   = 1;
-    blink_dec_start    = millis();
+    blink_dec_start    = millis_custom();
     PORTB |=  (1<<PB0);    // 감소 LED ON
 }
+// 메인 루프에서 계속 호출: 100ms가 지난 깜빡임 LED를 꺼준다
 void blink_update(void) {
-    uint32_t now = millis();
-    // 증가 LED(PD7) 깜박임 처리 (예: 100ms 후 꺼짐)
+    uint32_t now = millis_custom();
     if (blink_inc_active && (now - blink_inc_start >= 100)) {
-        PORTD &= ~(1<<PD7);
+        PORTD &= ~(1<<PD7);   // 100ms 지났으니 소등
         blink_inc_active = 0;
     }
-    // 감소 LED(PB0) 깜박임 처리 (예: 100ms 후 꺼짐)
     if (blink_dec_active && (now - blink_dec_start >= 100)) {
         PORTB &= ~(1<<PB0);
         blink_dec_active = 0;
     }
 }
 
-// 노즐 이동 시간 테이블 (ms)
-const uint16_t nozzle_fwd_time[3] = {1000, 1500, 2000};
-const uint16_t nozzle_back_time[3] = {1000, 1500, 2000};
-
-
 // -------------------------------------------------------------------------------------------
 
-// 타이머 함수들 (millis 사용) 
+// 타이머 함수들 (millis_custom / micros_custom)
+// 아두이노의 millis()/micros()와 같은 역할을 직접 만든 것.
+// "프로그램이 시작된 후 몇 ms(또는 us)가 지났는가"를 알려줘서,
+// _delay_ms()처럼 CPU를 멈춰 세우지 않고도 "몇 초 후에 다음 동작"을 만들 수 있게 해준다.
+// Timer2를 이 용도로 전용 사용 (Timer0은 pump_init()에서 펌프 PWM 전용으로 사용 -> 서로 간섭 없음)
 
-// 타이머 관련 전역 변수
-volatile uint32_t timer0_overflow_count = 0;     // 타이머 오버플로우 횟수
-volatile uint32_t timer0_millis = 0;             // 밀리초 카운터
-static uint8_t timer0_fract = 0;                 // 분수 밀리초 (정밀도 향상용)
+volatile uint32_t systick_overflow_count = 0;  // 타이머가 0으로 넘어간(오버플로우) 누적 횟수
+volatile uint32_t systick_millis = 0;          // 지금까지 흐른 시간(ms)
+static uint8_t systick_fract = 0;              // 1ms 단위로 딱 안 떨어지는 오차를 보정하는 값
 
-// 상수 정의 (16MHz, 64 분주비 기준)
-// 타이머0 오버플로우 시간 = 256 틱 * (64 / 16000000) = 1.024ms
-#define MICROSECONDS_PER_TIMER0_OVERFLOW 1024UL  // 1.024ms = 1024μs per overflow
 #define MILLIS_INC 1
 #define FRACT_INC 3       // 1024 % 1000 = 24 -> 24 >> 3 = 3
-#define FRACT_MAX 125     // 1000 >> 3 = 125                                // 분수 밀리초 최대값 (125)
+#define FRACT_MAX 125     // 1000 >> 3 = 125
 
-// Timer0 오버플로우 인터럽트 서비스 루틴
-ISR(TIMER0_OVF_vect) {
-	// 현재 밀리초와 분수 밀리초 값 가져오기
-	uint32_t m = timer0_millis;
-	uint8_t f = timer0_fract;
-	// 오버플로우당 증가량 더하기
+// Timer2가 0xFF(255)를 넘어갈 때마다(약 1.024ms마다) 자동으로 실행되는 인터럽트.
+// 여기서 "시간이 흘렀다"는 걸 systick_millis에 계속 누적시킨다.
+ISR(TIMER2_OVF_vect) {
+	uint32_t m = systick_millis;
+	uint8_t f = systick_fract;
 	m += MILLIS_INC;
 	f += FRACT_INC;
-	
-	// 분수 밀리초가 최대값을 초과하면 밀리초 1 추가
-	if (f >= FRACT_MAX) {
+
+	if (f >= FRACT_MAX) {   // 오차가 쌓여 1ms가 되면 millis에 1을 더 더해줌
 		f -= FRACT_MAX;
 		m += 1;
 	}
-	// 값 업데이트
-	timer0_fract = f;
-	timer0_millis = m;
-	timer0_overflow_count++;
+	systick_fract = f;
+	systick_millis = m;
+	systick_overflow_count++;
 }
 
-// Timer0 초기화 함수
-void timer0_init(void) {
-	// 인터럽트 비활성화
-	cli();
-	
-	// 타이머/카운터 0 레지스터 초기화
-	TCCR0A = 0;  // 일반 모드
-	
-	// 분주비 64 설정 (CS01=1, CS00=1)
-	// 16MHz에서 분주비 64일 때 타이머 클럭은 250kHz (4μs 간격)
-	TCCR0B = (1 << CS01) | (1 << CS00);
-	
-	// 타이머 오버플로우 인터럽트 활성화
-	TIMSK0 |= (1 << TOIE0);
-	
-	// 카운터와 플래그 초기화
-	timer0_overflow_count = 0;
-	timer0_millis = 0;
-	timer0_fract = 0;
-	
-	// 인터럽트 활성화
-	sei();
+// Timer2를 "1.024ms마다 한 번씩 인터럽트 발생"하도록 설정하고 millis 카운트를 시작
+void systick_init(void) {
+	cli();                       // 설정 도중 다른 인터럽트가 끼어들지 않게 잠깐 금지
+	TCCR2A = 0;                  // 일반 모드(그냥 계속 세기만 함)
+	TCCR2B = (1 << CS22);       // 클럭을 64분주 (16MHz/64) 해서 타이머에 넣음
+	TIMSK2 |= (1 << TOIE2);     // 오버플로우 인터럽트 켜기 (다 세면 위 ISR이 호출됨)
+
+	systick_overflow_count = 0;
+	systick_millis = 0;
+	systick_fract = 0;
+	sei();                       // 인터럽트 다시 허용
 }
 
-
-// 밀리초 반환 함수
-uint32_t millis(void) {
+// 지금까지 흐른 시간을 ms 단위로 반환 (아두이노 millis()와 같은 역할)
+uint32_t millis_custom(void) {
 	uint32_t m;
-	
-	// 원자적 블록 내에서 값 읽기 (인터럽트 영향 없이)
+	// ISR이 값을 바꾸는 도중에 읽어서 이상한 값이 나오지 않도록 잠깐 보호하며 읽음
 	ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-		m = timer0_millis;
+		m = systick_millis;
 	}
-	
 	return m;
 }
 
-// 마이크로초 반환 함수
-uint32_t micros(void) {
+// 지금까지 흐른 시간을 us(마이크로초) 단위로 반환 (millis_custom보다 더 정밀함)
+uint32_t micros_custom(void) {
 	uint32_t m;
 	uint8_t t;
-	
-	// 원자적 블록 내에서 오버플로우 카운트와 현재 타이머 값 읽기
+
 	ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-		m = timer0_overflow_count;
-		t = TCNT0;
-		
-		// 오버플로우 플래그가 설정되었지만 아직 인터럽트가 처리되지 않았는지 확인
-		// 이 경우 수동으로 오버플로우 카운트 증가 필요
-		if ((TIFR0 & (1 << TOV0)) && (t < 255)) {
+		m = systick_overflow_count;
+		t = TCNT2;   // 타이머가 지금 세고 있는 값(0~255)
+
+		// 막 오버플로우가 났는데 아직 카운트에 반영 안 됐으면 여기서 보정
+		if ((TIFR2 & (1 << TOV2)) && (t < 255)) {
 			m++;
 		}
 	}
-	
-	// 총 마이크로초 계산
-	// (오버플로우 횟수 * 256 + 현재 타이머값) * 타이머 틱당 μs
 	return ((m << 8) + t) * (64 / (F_CPU / 1000000UL));
-}
-
-// 딜레이 함수 (밀리초)
-void delay(uint32_t ms) {
-	uint32_t start = millis();
-	
-	while ((millis() - start) < ms) {
-		// 대기
-	}
 }
 
 // -------------------------------------------------------------------------------------------
 
-// Tone(비프음) 함수들
+// 부저 함수 (일반 GPIO 토글 방식 - 타이머 하드웨어 파형생성 미사용)
+// 원리: 스피커 핀을 아주 빠르게 켰다/껐다(High/Low) 반복하면 그 주파수만큼 소리가 난다.
+// 여기서는 약 2kHz로 250us마다 핀을 반전시켜서 "삑" 소리를 100ms 동안 낸다.
 
-volatile uint8_t isToneActive = 0;
+#define BUZZER_DDR             DDRB
+#define BUZZER_PORT            PORTB
+#define BUZZER_PIN              PB1
+#define BUZZER_HALF_PERIOD_US  250UL   // 약 2kHz (250us마다 반전 = 500us가 한 주기)
+#define BUZZER_DURATION_MS     100UL   // 총 울리는 시간
 
-void tone(unsigned long frequency) {
-    if (frequency == 0 || frequency > 10000) {
-        tone_stop();
+volatile uint8_t buzzer_active = 0;     // 지금 부저가 울리는 중인지
+uint32_t buzzer_start_time = 0;         // 울리기 시작한 시각(ms)
+uint32_t buzzer_last_toggle_us = 0;     // 마지막으로 핀을 반전시킨 시각(us)
+
+// 부저 울리기 시작 (버튼 누를 때마다 이 함수를 호출)
+void buzzer_start(void) {
+    BUZZER_DDR |= (1 << BUZZER_PIN);   // 부저 핀을 출력으로 설정
+    buzzer_active = 1;
+    buzzer_start_time = millis_custom();
+    buzzer_last_toggle_us = micros_custom();
+}
+
+// 부저 끄기
+void buzzer_stop(void) {
+    BUZZER_PORT &= ~(1 << BUZZER_PIN);
+    buzzer_active = 0;
+}
+
+// 메인 루프에서 계속 호출: 시간이 됐으면 핀을 반전시키거나, 100ms 지났으면 꺼준다
+// (delay 없이 동작하므로 다른 작업을 막지 않음)
+void buzzer_update(void) {
+    if (!buzzer_active) return;   // 울리는 중이 아니면 할 일 없음
+
+    if (millis_custom() - buzzer_start_time >= BUZZER_DURATION_MS) {
+        buzzer_stop();   // 100ms 다 채웠으면 종료
         return;
     }
-    DDRB |= (1 << PB1);
-    TCCR1A = 0;
-    TCCR1B = (1 << WGM12);
-    TCCR1B |= (1 << CS11);
-    uint16_t ocr_val = (2000000 / (2 * frequency)) - 1;
-    OCR1A = ocr_val;
-    TCCR1A |= (1 << COM1A0);
-    isToneActive = 1;
-}
 
-void tone_stop() {
-    TCCR1A = 0;
-    TCCR1B = 0;
-    isToneActive = 0;
-}
-
-volatile uint8_t isToneOn = 0;
-uint32_t tone_start_time = 0;
-
-void tone_on() {
-    tone(440);
-    isToneOn = 1;
-    tone_start_time = millis();
-}
-
-void tone_update() {
-    if (isToneOn && (millis() - tone_start_time >= 100)) {
-        tone_stop();
-        isToneOn = 0;
+    uint32_t now_us = micros_custom();
+    if (now_us - buzzer_last_toggle_us >= BUZZER_HALF_PERIOD_US) {
+        BUZZER_PORT ^= (1 << BUZZER_PIN);   // 핀 상태 반전 (High<->Low)
+        buzzer_last_toggle_us = now_us;
     }
 }
 
 // -------------------------------------------------------------------------------------------
 
 // uart 함수
+// UART는 컴퓨터(시리얼 모니터)로 텍스트를 보내서 디버깅하기 위한 통신 방법.
+// 여기서는 TX(보내기)만 쓰고 RX(받기)는 사용하지 않는다.
 
+// UART를 9600bps 속도로 초기화
 void uart_init() {
     UBRR0H = 0;
     UBRR0L = 103; // 9600 baud for 16MHz
-    UCSR0B = (1 << TXEN0);
-    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+    UCSR0B = (1 << TXEN0);   // TX만 사용, RX 비활성화
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);   // 데이터 8비트 전송
 }
 
+// 문자 1개를 시리얼로 전송
 void uart_transmit(char data) {
-    while (!(UCSR0A & (1 << UDRE0)));
+    while (!(UCSR0A & (1 << UDRE0)));   // 이전 전송이 끝날 때까지 대기
     UDR0 = data;
 }
 
+// RAM에 있는 문자열(예: snprintf로 만든 문자열)을 한 글자씩 전송
 void uart_print(const char* str) {
     while (*str) {
         uart_transmit(*str++);
     }
 }
 
-void uart_print_key(const char* keyname, const char* label) {
+// 플래시(PROGMEM)에 저장된 문자열을 한 글자씩 읽어와 전송
+// - PSTR("...")로 감싼 문자열은 RAM이 아니라 플래시에 저장되어 SRAM을 절약할 수 있다
+// - pgm_read_byte()로 플래시에서 한 바이트씩 읽어야 한다 (AVR은 플래시를 직접 못 읽음)
+void uart_print_P(const char* str_P) {
+    char c;
+    while ((c = pgm_read_byte(str_P++))) {
+        uart_transmit(c);
+    }
+}
+
+// "[키이름] 동작설명" 형태로 시리얼에 출력 (예: "[4] nozzle phase - (2)")
+void uart_print_key_P(const char* keyname_P, const char* label_P) {
     uart_transmit('[');
-    uart_print(keyname);
+    uart_print_P(keyname_P);
     uart_transmit(']');
     uart_transmit(' ');
-    uart_print(label);
+    uart_print_P(label_P);
     uart_transmit('\n');
 }
 
 // -------------------------------------------------------------------------------------------
 
 // led 매트릭스, 키패드 매트릭스 함수
+//
+// LED 16개(4x4)와 키패드 16개(4x4 버튼)는 핀을 16개씩 쓰지 않고
+// "행(row) 4개 + 열(column) 4개"로 배선해서 8개 핀만으로 제어한다 (매트릭스 방식).
+// - LED: 한 번에 한 행만 켜고 나머지는 꺼서, 아주 빠르게 행을 바꿔가며 반복하면
+//        사람 눈에는 잔상 때문에 여러 LED가 동시에 켜진 것처럼 보인다 (멀티플렉싱).
+// - 키패드: 한 행씩 순서대로 LOW로 끌어내리고, 그 상태에서 각 열을 읽어서
+//           어떤 버튼이 눌렸는지 알아낸다.
+// - LED 매트릭스와 키패드 매트릭스는 "행" 핀(PB2~PB5)을 공유하고 "열" 핀은 따로 쓴다.
+//   그래서 LED를 켤 때와 키패드를 스캔할 때 핀의 입출력 방향을 서로 바꿔가며 사용한다.
 
+// LED 매트릭스를 쓰기 위해 관련 핀들을 출력으로 설정
 void led_matrix_enter() {
-    DDRB |= 0b1111<<2;
-    DDRC |= 0b1111<<0;
+    DDRB |= 0b1111<<2;   // PB2~PB5 : 행 선택 핀, 출력으로
+    DDRC |= 0b1111<<0;   // PC0~PC3 : 열 선택 핀, 출력으로
 }
 
-uint8_t led_idx=0;
+uint8_t led_idx=0;   // 지금 몇 번째 행을 켜고 있는지 (0~3)
+// LED 4x4의 각 행에서 어떤 열을 켤지 나타내는 패턴 (해당 비트가 0이면 켜짐)
 uint8_t led_pattern[4]={
     0b0111,
     0b1111,
@@ -250,20 +256,25 @@ uint8_t led_pattern[4]={
     0b1111
 };
 
+// 메인 루프에서 계속 호출됨: 호출될 때마다 "다음 한 행"만 켜준다
+// (여러 번 빠르게 호출되면서 행이 계속 바뀌어 잔상 효과가 생김)
 void led_matrix_loop() {
-    PORTB &= ~(0b1111<<2);
-    PORTC |= 0b1111;
-	PORTC = (PORTC & 0b11110000) | (led_pattern[led_idx] & 0x0F); // 기존 0b11100000이었는데 먼가 시트 깜빡임 잘 안돼서 수정
+    PORTB &= ~(0b1111<<2);     // 일단 모든 행을 끔
+	PORTC = (PORTC & 0b11110000) | (led_pattern[led_idx] & 0x0F);  // 이번 행에서 켤 열 설정
 
-    PORTB |= 1<<(5-led_idx);
-    if(++led_idx>3) led_idx = 0;
+    PORTB |= 1<<(5-led_idx);   // 이번 행만 켜기
+    if(++led_idx>3) led_idx = 0;   // 다음 호출을 위해 행 번호 증가 (3 다음엔 0으로)
 }
 
+// LED 매트릭스 사용을 마치고 핀을 원래대로 되돌림 - 키패드 스캔과의 충돌 방지
 void led_matrix_exit() {
     DDRB &= ~(0b1111<<2);
     DDRC &= ~(0b1111<<0);
 }
 
+// 키패드 매트릭스를 쓰기 위해 핀 방향을 설정
+// - 행(PB2~PB5): 출력, 평소엔 HIGH로 뒀다가 한 행씩 LOW로 내려서 스캔
+// - 열(PD0,2,3,4): 입력 + 내부 풀업 (버튼 안 눌렸을 땐 자동으로 HIGH가 되게 함)
 void keypad_matrix_enter() {
     DDRB |= (1 << PB5) | (1 << PB4) | (1 << PB3) | (1 << PB2);
     PORTB |= (1 << PB5) | (1 << PB4) | (1 << PB3) | (1 << PB2);
@@ -271,6 +282,7 @@ void keypad_matrix_enter() {
     PORTD |=  (1 << PD4) | (1 << PD3) | (1 << PD2) | (1 << PD0);
 }
 
+// 키패드 스캔을 마치고 핀을 다시 원래대로(입력, 풀업 없음) 되돌림 - LED 매트릭스와의 충돌 방지
 void keypad_matrix_exit() {
     DDRB &= ~((1 << PB5) | (1 << PB4) | (1 << PB3) | (1 << PB2));
     DDRD &= ~((1 << PD4) | (1 << PD3) | (1 << PD2) | (1 << PD0));
@@ -278,21 +290,24 @@ void keypad_matrix_exit() {
     PORTD &= ~((1 << PD4) | (1 << PD3) | (1 << PD2) | (1 << PD0));
 }
 
-const char key_map[4][4] = {
+// 키패드의 (행,열) 위치에 어떤 문자가 있는지 나타내는 표. PROGMEM이라 플래시에 저장됨
+const char key_map[4][4] PROGMEM = {
     {'1', '2', '3', 'A'},
     {'4', '5', '6', 'B'},
     {'7', '8', '9', 'C'},
     {'*', '0', '#', 'D'}
 };
 
-uint8_t prev_key[4] = {0, 0, 0, 0};
+uint8_t prev_key[4] = {0, 0, 0, 0};  // 직전 스캔에서 각 행의 어떤 열이 눌려있었는지 기억 (눌리는 순간만 감지하기 위함)
 
+// (row, col) 위치의 LED를 켜거나(on=1) 끔(on=0)
 void led_set(uint8_t row, uint8_t col, uint8_t on) {
     if (row > 3 || col > 3) return;
-    if (on) led_pattern[row] &= ~(1 << (3 - col));
+    if (on) led_pattern[row] &= ~(1 << (3 - col));   // 0으로 만들면 켜짐 (배선이 그렇게 되어 있음)
     else    led_pattern[row] |=  (1 << (3 - col));
 }
 
+// (row, col) 위치의 LED가 켜져 있는지 확인
 uint8_t led_get(uint8_t row, uint8_t col) {
     if (row > 3 || col > 3) return 0;
     return !(led_pattern[row] & (1 << (3 - col)));
@@ -302,190 +317,199 @@ uint8_t led_get(uint8_t row, uint8_t col) {
 
 // 상태변화 관련
 
-uint8_t water_pressure = 1;
-uint8_t seat_temperature = 0;
-uint8_t nozzle_phase = 1;
-uint8_t seat_sensor = 0;
+uint8_t water_pressure = 1;     // 수압 단계 1~3
+uint8_t seat_temperature = 0;   // 시트 히터 단계 0(꺼짐)~3
+uint8_t nozzle_phase = 1;       // 노즐 위치 단계 1~3
+uint8_t seat_sensor = 0;        // 사람이 앉아있으면 1, 아니면 0
 
-volatile uint8_t sequence_active = 0;  // 비데/세정 시퀀스 실행 중 플래그
+volatile uint8_t sequence_active = 0;  // 비데/세정 시퀀스(2,3번 키로 시작한 전체 동작)가 진행 중인지
 
+volatile uint8_t dry_mode_active = 0;  // A키로 시작한 "수동 건조"가 진행 중인지
+uint32_t dry_mode_start_time = 0;      // 수동 건조를 시작한 시각(ms)
 
-volatile uint8_t stop_dry_flag = 0;
-volatile uint8_t dry_mode_active = 0;
-uint32_t dry_mode_start_time = 0;
+volatile uint8_t stop_requested = 0;   // "정지" 요청이 들어와서 처리 대기 중인지
 
-volatile uint8_t stop_requested = 0;
-
+// 정지(취소) 버튼 또는 시트센서 이탈 시 호출되는 함수.
+// 어떤 상태에 있든 안전하게 대기 상태로 되돌리는 역할을 한다.
 void stop() {
-   stop_requested = 1;
-   tone_on();  // 비프음 먼저
+  buzzer_start();  // 비프음 먼저
 
   if (dry_mode_active) {
-    PORTC &= ~(1 << PC5);
+    fan_off();
     led_set(0, 3, 0);
     dry_mode_active = 0;
   }
 
-  if (sequence_active) {
-    sequence_active = 0;
+  if (!sequence_active) return;   // 진행 중인 시퀀스가 없으면 stop_requested를 세우지 않는다 (다음 동작 오염 방지)
 
-    // 현재 상태에 따라 전이 판단
-    if (current_state == STATE_NOZZLE_FORWARD || current_state == STATE_PUMP_ON) {
-      enter_state(STATE_NOZZLE_BACK);  
-    } else {
-      enter_state(STATE_IDLE);  // 나머지는 그냥 바로 종료
-    }
+  sequence_active = 0;
+  stop_requested = 1;
+
+  // 이동 타이머가 아직 걸리지 않는 상태(전진/강세정)는 즉시 원위치 전이를 걸어준다.
+  // NOZZLE_BACK/PUMP_WEAK/DRY는 update_state()의 stop_requested 처리에 맡긴다.
+  // (특히 NOZZLE_BACK 도중이면 복귀 이동 시간을 다 채운 뒤에 IDLE로 가야 "노즐원위치" 요구사항을 만족)
+  if (current_state == STATE_NOZZLE_FORWARD || current_state == STATE_PUMP_ON) {
+    enter_state(STATE_NOZZLE_BACK);
   }
 }
-           
 
 
-// —— 펌프 초기화 (OC0A=D6) —— 
+// —— 펌프 초기화 (OC0B=D6, PWM으로 수압 세기를 조절) ——
 void pump_init(void) {
     DDRD  |= (1<<PD5);                          // D6 출력
     TCCR0A = (1<<COM0B1)|(1<<WGM01)|(1<<WGM00); // Fast PWM, 비반전
     TCCR0B = (1<<CS01)|(1<<CS00);               // 분주비 64
 }
 
-// —— 수압 단계별 PWM 설정 —— 
+// —— 수압 단계별 PWM 설정 ——
+// PWM 값이 클수록 평균적으로 핀이 HIGH인 시간이 길어져서 "더 세게" 켜진 것처럼 동작한다
+// level: 0=꺼짐, 1=약, 2=중, 3=강
 void pump_set(uint8_t level) {
-    static const uint8_t tbl[4] = {0, 64, 128, 255};
+    static const uint8_t tbl[4] = {0, 64, 128, 255};   // 각 단계에 해당하는 PWM 값(0~255)
     OCR0B = (level < 4) ? tbl[level] : 0;
 }
-// —— 노즐 설정 —— 
+// —— 노즐 방향 표시 LED ——
 static inline void nozzle_led_forward(void) {
-    PORTB |=  (1<<PB0);
+    PORTB |=  (1<<PB0);   // "노즐 전진" LED 켜기
 }
 static inline void nozzle_led_backward(void) {
-    PORTD |=  (1<<PD7);
+    PORTD |=  (1<<PD7);   // "노즐 후진" LED 켜기
 }
 static inline void nozzle_led_off(void) {
+    // 깜빡이는 중(blink_*)이 아닐 때만 꺼준다 - 안 그러면 깜빡임 효과와 서로 충돌함
     if (!blink_inc_active) PORTD &= ~(1<<PD7);
     if (!blink_dec_active) PORTB &= ~(1<<PB0);
 }
-// 노즐설정 
-const uint16_t nozzle_fwd_time_bidet[3]  = {1000, 1500, 2000};
-const uint16_t nozzle_back_time_bidet[3] = {1000, 1500, 2000};
+// —— 건조팬 설정 (수동 건조와 시퀀스 건조 단계가 공유) ——
+void fan_on(void) {
+    DDRC  |= (1 << PC5);
+    PORTC |= (1 << PC5);
+}
+void fan_off(void) {
+    PORTC &= ~(1 << PC5);
+}
+// 노즐 위치(1/2/3단계)에 따라 전진/후진에 걸리는 시간(ms).
+// 세정(wash)과 비데(bidet)가 서로 다른 이동 시간을 쓴다. PROGMEM으로 플래시에 저장해 SRAM 절약.
+const uint16_t nozzle_fwd_time_bidet[3]  PROGMEM = {1000, 1500, 2000};
+const uint16_t nozzle_back_time_bidet[3] PROGMEM = {1000, 1500, 2000};
 
-const uint16_t nozzle_fwd_time_wash[3]   = {2000, 2500, 3000};
-const uint16_t nozzle_back_time_wash[3]  = {2000, 2500, 3000};
+const uint16_t nozzle_fwd_time_wash[3]   PROGMEM = {2000, 2500, 3000};
+const uint16_t nozzle_back_time_wash[3]  PROGMEM = {2000, 2500, 3000};
 
+// 지금 어떤 이동시간 표를 쓸지 가리키는 포인터 (2번/3번 키에 따라 바뀜)
 const uint16_t *current_nozzle_fwd_time = nozzle_fwd_time_bidet;
 const uint16_t *current_nozzle_back_time = nozzle_back_time_bidet;
 
 
+// 수동 건조(A키) 시작 후 3초가 지나면 자동으로 꺼주는 함수. 메인 루프에서 계속 호출됨
 void update_dry_mode() {
-    if (dry_mode_active && (millis() - dry_mode_start_time >= 3000)) {
-        uart_print("dry complete\n");
-        PORTC &= ~(1 << PC5);
-        led_set(0, 3, 0); 
+    if (dry_mode_active && (millis_custom() - dry_mode_start_time >= 3000)) {
+        uart_print_P(PSTR("dry complete\n"));
+        fan_off();
+        led_set(0, 3, 0);
         dry_mode_active = 0;
     }
 }
 
+// 시트 히터를 설정 단계(N)에 맞춰 N초 간격으로 깜빡여주는 함수. 메인 루프에서 계속 호출됨
 void seat_heater_blink_update() {
     static uint8_t state = 0; // 0: off, 1: on
     static uint32_t last_time = 0;
 
-    uint32_t now = millis();
+    uint32_t now = millis_custom();
 
-    if (seat_temperature == 0) {
+    if (seat_temperature == 0) {   // 히터가 꺼져있으면 그냥 꺼진 상태 유지
         PORTC &= ~(1 << PC4);
         state = 0;
         return;
     }
 
-    if (state == 0 && (now - last_time >= seat_temperature * 1000)) {
-        PORTC |= (1 << PC4);
-        state = 1;
-        last_time = now;
-    }
-    else if (state == 1 && (now - last_time >= 1000)) {
-        PORTC &= ~(1 << PC4);
-        state = 0;
+    uint32_t interval = (uint32_t)seat_temperature * 1000UL;  // N초마다 토글 (on/off 대칭)
+    if (now - last_time >= interval) {
+        state = !state;   // 켜져있으면 끄고, 꺼져있으면 켬
+        if (state) PORTC |= (1 << PC4);
+        else       PORTC &= ~(1 << PC4);
         last_time = now;
     }
 }
 
-void enter_state(BidetState s) { 
+// 상태를 s로 바꾸고, 그 상태에 처음 들어갈 때 한 번만 해야 할 초기화 작업을 수행
+void enter_state(BidetState s) {
     current_state = s;
-    state_start_time = millis();
-    // 초기화 작업
+    state_start_time = millis_custom();   // 경과시간을 0부터 다시 재기 시작
     switch(s) {
-      case STATE_IDLE:
-        nozzle_led_off();
-        pump_set(0); /*펌프 끄기*/
-        PORTC       &= ~(1 << PC5);  // 팬 OFF
-        led_set(0, 3, 0);            // 건조 LED OFF
-        // motor_stop(); fan_off();
-        uart_print("STATE: IDLE\n");
-        break;
-      case STATE_NOZZLE_FORWARD:
-        nozzle_led_forward();
-        // motor_forward();
-        uart_print("STATE: NOZZLE_FORWARD\n");
-        break;
-      case STATE_PUMP_ON:
-        nozzle_led_off();
-        pump_set(water_pressure);
-        uart_print("STATE: PUMP_ON\n");
-        break;
-      case STATE_NOZZLE_BACK:
-        nozzle_led_backward();
-        // motor_backward();
-        uart_print("STATE: NOZZLE_BACK\n");
-        break;
-      case STATE_PUMP_WEAK:
-        nozzle_led_off();
-        pump_set(1);
-        uart_print("STATE: PUMP_WEAK\n");
-        break;
-      case STATE_DRY:
+      case STATE_IDLE:      // 대기: 모든 동작 정지
         nozzle_led_off();
         pump_set(0);
-        DDRC       |=  (1 << PC5);   // 팬 ON
-        PORTC       |=  (1 << PC5);
-        led_set(0, 3, 1);           
-        // fan_on();
-        uart_print("STATE: DRY\n");
+        fan_off();
+        led_set(0, 3, 0);            // 건조 LED OFF
+        uart_print_P(PSTR("STATE: IDLE\n"));
+        break;
+      case STATE_NOZZLE_FORWARD:   // 노즐 전진 시작
+        nozzle_led_forward();
+        uart_print_P(PSTR("STATE: NOZZLE_FORWARD\n"));
+        break;
+      case STATE_PUMP_ON:   // 설정된 수압으로 세정 시작
+        nozzle_led_off();
+        pump_set(water_pressure);
+        uart_print_P(PSTR("STATE: PUMP_ON\n"));
+        break;
+      case STATE_NOZZLE_BACK:   // 노즐 복귀 시작
+        nozzle_led_backward();
+        uart_print_P(PSTR("STATE: NOZZLE_BACK\n"));
+        break;
+      case STATE_PUMP_WEAK:   // 약하게 헹구기 시작
+        nozzle_led_off();
+        pump_set(1);
+        uart_print_P(PSTR("STATE: PUMP_WEAK\n"));
+        break;
+      case STATE_DRY:   // 건조 시작
+        nozzle_led_off();
+        pump_set(0);
+        fan_on();
+        led_set(0, 3, 1);
+        uart_print_P(PSTR("STATE: DRY\n"));
         break;
     }
 }
 
-void update_state(void) { 
-    uint32_t e = millis() - state_start_time;
+// 메인 루프에서 계속 호출됨: 현재 상태에서 얼마나 시간이 지났는지 확인하고,
+// 정해진 시간(또는 조건)이 되면 다음 상태로 자동으로 넘어가게 한다
+void update_state(void) {
+    uint32_t e = millis_custom() - state_start_time;  // 이 상태에 들어온 지 얼마나 지났는지(ms)
     switch(current_state) {
       case STATE_NOZZLE_FORWARD:
-        if (e >= current_nozzle_fwd_time[nozzle_phase-1]) enter_state(STATE_PUMP_ON);
+        // 설정된 노즐 단계만큼 전진 시간이 다 지나면 세정 시작
+        if (e >= pgm_read_word(&current_nozzle_fwd_time[nozzle_phase-1])) enter_state(STATE_PUMP_ON);
         break;
       case STATE_PUMP_ON:
-        if (e >= 5000) {
-        enter_state(STATE_NOZZLE_BACK);
-      }
-    break;
-      case STATE_NOZZLE_BACK:
-        if (e >= current_nozzle_back_time[nozzle_phase - 1]) {
-        if (stop_requested) {
-            enter_state(STATE_IDLE);
-            stop_requested = 0; // IDLE에서만 리셋
-        } else {
-            enter_state(STATE_PUMP_WEAK);
+        if (e >= 5000) {   // 강한 세정은 5초간 진행
+          enter_state(STATE_NOZZLE_BACK);
         }
-    }
+        break;
+      case STATE_NOZZLE_BACK:
+        if (e >= pgm_read_word(&current_nozzle_back_time[nozzle_phase - 1])) {
+          if (stop_requested) {
+              enter_state(STATE_IDLE);   // 정지 요청이 있었다면 복귀가 끝났으니 바로 대기로
+              stop_requested = 0;
+          } else {
+              enter_state(STATE_PUMP_WEAK);   // 정상 진행이면 약하게 헹구는 단계로
+          }
+        }
         break;
       case STATE_PUMP_WEAK:
         if (stop_requested) {
-        enter_state(STATE_IDLE);
-        stop_requested = 0;
-    } else if (e >= 1000) {
-        enter_state(STATE_DRY);
-    }
+          enter_state(STATE_IDLE);
+          stop_requested = 0;
+        } else if (e >= 1000) {   // 약한 헹굼은 1초간 진행
+          enter_state(STATE_DRY);
+        }
         break;
       case STATE_DRY:
-        if (stop_requested || e >= 3000) {
-        enter_state(STATE_IDLE);
-        stop_requested = 0;
-    }
+        if (stop_requested || e >= 3000) {   // 건조는 3초, 또는 정지요청 시 바로 종료
+          enter_state(STATE_IDLE);
+          stop_requested = 0;
+        }
         break;
       default: break;
     }
@@ -496,209 +520,217 @@ void update_state(void) {
 
 // 키패드 매트릭스 입력받으면 동작하는 부분
 
+void debug_status(void);
+
+// 4x4 키패드를 한 행씩 스캔해서, 눌린 키가 있으면 그 키에 해당하는 동작을 실행한다
 void keypad_matrix_input(void) {
     for (uint8_t row = 0; row < 4; row++) {
-        PORTB |= (0b1111 << 2);
-        PORTB &= ~(1 << (5 - row));
-        _delay_us(2);
+        PORTB |= (0b1111 << 2);       // 모든 행을 일단 HIGH로
+        PORTB &= ~(1 << (5 - row));   // 이번에 확인할 행만 LOW로 내림
+        _delay_us(2);                 // 전압이 안정될 때까지 아주 잠깐 대기
 
+        // 이번 행에서 어떤 열이 눌려있는지 확인 (풀업이라 눌리면 LOW가 됨)
         uint8_t key = 0;
         if (!(PIND & (1 << 4))) key |= (1 << 0);
         if (!(PIND & (1 << 3))) key |= (1 << 1);
         if (!(PIND & (1 << 2))) key |= (1 << 2);
         if (!(PIND & (1 << 0))) key |= (1 << 3);
 
+        // 직전 스캔과 비교해서 "새로 눌린" 열만 골라냄 (누르고 있는 동안 계속 반응하지 않게)
         uint8_t rising = (key ^ prev_key[row]) & key;
         prev_key[row] = key;
 
         for (uint8_t col = 0; col < 4; col++) {
-            if (rising & (1 << col)) {
-                char key_char = key_map[row][col];
-              
-                if (key_char == '4') { 
-                    if (seat_sensor 
-                        && (current_state == STATE_IDLE || current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK)) {
-                        tone_on();
-                        PORTB |=  (1<<PB0);
-                        PORTD &= ~(1<<PD7);
-                    if (led_get(2, 2)) {
-                        uart_print_key("4", "nozzle phase - (2)");
-                        led_set(2, 2, 0);
-                        led_set(2, 1, 1);
-                        nozzle_phase = 2;
-                        start_dec_blink();
-                    } else if (led_get(2, 1)) {
-                        uart_print_key("4", "nozzle phase - (1)");
-                        led_set(2, 1, 0);
-                        led_set(2, 0, 1);
-                        nozzle_phase = 1;
-                        start_dec_blink();
-                    } else {
-                        uart_print_key("4", "nozzle phase - (1)");
-                    }
-                      		
-                  }
-                } else if (key_char == '5') {
-                    if (seat_sensor  
-                        && (current_state == STATE_IDLE || current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK)) {
-                        tone_on();
-                        PORTB |=  (1<<PB7);
-                        PORTD &= ~(1<<PD0);                      
-                    if (led_get(2, 1)) {
-                        uart_print_key("5", "nozzle phase + (3)");
-                        led_set(2, 1, 0);
-                        led_set(2, 2, 1);
-                        nozzle_phase = 3;
-                        start_inc_blink(); 
-                    } else if (led_get(2, 0)) {
-                        uart_print_key("5", "nozzle phase + (2)");
-                        led_set(2, 0, 0);
-                        led_set(2, 1, 1);
-                        nozzle_phase = 2;
-                        start_inc_blink();
-                    } else {
-                        uart_print_key("5", "nozzle phase + (3)");
-                    }
-                  }
-                } else if (key_char == '7') {
-                  if (!dry_mode_active && seat_sensor) {
-                    tone_on();
-                    if (led_get(0, 0) && led_get(0, 1) && led_get(0, 2)) {
-                        uart_print_key("7", "water pressure - (2)");
-                        led_set(0, 2, 0);
-                        water_pressure = 2;
-                    } else if (led_get(0, 0) && led_get(0, 1)) {
-                        uart_print_key("7", "water pressure - (1)");
-                        led_set(0, 1, 0);
-                        water_pressure = 1;
-                    } else {
-                        uart_print_key("7", "water pressure - (1)");
-                    }
-                  }
-                } else if (key_char == '8') {
-                  if (!dry_mode_active && seat_sensor) {
-                    tone_on();
-                    if (led_get(0, 0) && led_get(0, 1)) {
-                        uart_print_key("8", "water pressure + (3)");
-                        led_set(0, 2, 1);
-                        water_pressure = 3;
-                    } else if (led_get(0, 0)) {
-                        uart_print_key("8", "water pressure + (2)");
-                        led_set(0, 1, 1);
-                        water_pressure = 2;
-                    } else {
-                        uart_print_key("8", "water pressure + (3)");
-                    }
-                  }
-                } else if (key_char == 'B') {
-                  if (!dry_mode_active) {               
-                    tone_on();
-                    if (led_get(1, 0) && led_get(1, 1) && led_get(1, 2)) {
-                        uart_print_key("B", "change seat temperature (off)");
-                        led_set(1, 0, 0);
-                        led_set(1, 1, 0);
-                        led_set(1, 2, 0);
-                        seat_temperature = 0;
-                    } else if (led_get(1, 0) && led_get(1, 1)) {
-                        uart_print_key("B", "change seat temperature (on : 3)");
-                        led_set(1, 2, 1);
-                        seat_temperature = 3;
-                    } else if (led_get(1, 0)) {
-                        uart_print_key("B", "change seat temperature (on : 2)");
-                        led_set(1, 1, 1);
-                        seat_temperature = 2;
-                    } else {
-                        uart_print_key("B", "change seat temperature (on : 1)");
-                        led_set(1, 0, 1);
-                        seat_temperature = 1;
-                    }
-                  }
-                } else if (key_char == 'A') {
-                  if (!dry_mode_active && seat_sensor) {
-                    uart_print_key("A", "dry");
-                    tone_on();
-                    DDRC |= (1 << PC5);
-                    PORTC |= (1 << PC5);
-                    led_set(0, 3, 1);
-                    dry_mode_active = 1;
-                    dry_mode_start_time = millis(); 
-                  }
-                } else if (key_char == '1') {
-                  if (seat_sensor) {
-                    uart_print_key("1", "STOP");
-                    tone_on();
-                    stop(); 
-                  }
-                } else if (key_char == '2')  {//세훈추가
-                  if (seat_sensor && current_state==STATE_IDLE) {
-                    tone_on();
-                    uart_print_key("2", "wash start");
-                    sequence_active = 1;
-                    current_nozzle_fwd_time  = nozzle_fwd_time_wash;
-                    current_nozzle_back_time = nozzle_back_time_wash;
-                    enter_state(STATE_NOZZLE_FORWARD);
-                  }  
-                } else if (key_char == '3') {//세훈추가
-                  if (seat_sensor && current_state==STATE_IDLE) {
-                    tone_on();
-                    uart_print_key("3", "bidet start");
-                    sequence_active = 1;
-                    current_nozzle_fwd_time  = nozzle_fwd_time_bidet;
-                    current_nozzle_back_time = nozzle_back_time_bidet;
-                    enter_state(STATE_NOZZLE_FORWARD);
-                  }  
-            }
+            if (rising & (1 << col)) {   // 이 열의 키가 이번에 새로 눌렸다면
+                char key_char = pgm_read_byte(&key_map[row][col]);   // 눌린 키가 어떤 문자인지 찾기
 
-              
-  else if (key_char == '*') {		// 디버깅용 * 눌렀을 때 수압, 시트온도, 노즐위치, 시트센터상태 표시
-  uart_print_key("*", "debug");		// 디버깅용
-  tone_on();						// 디버깅용
-  debug_status();  // 상태 출력		// 디버깅용
-  }									// 디버깅용
-              
-              else {
-                if (!dry_mode_active && seat_sensor) {
-                    uart_transmit('[');
-                    uart_transmit(key_char);
-                    uart_transmit(']');
-                    uart_transmit('\n');
+                if (key_char == '4') {   // 노즐 위치 - (낮은 단계로)
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK) {
+                            start_dec_blink();
+                            if (led_get(2, 2)) {
+                                uart_print_key_P(PSTR("4"), PSTR("nozzle phase - (2)"));
+                                led_set(2, 2, 0);
+                                led_set(2, 1, 1);
+                                nozzle_phase = 2;
+                            } else if (led_get(2, 1)) {
+                                uart_print_key_P(PSTR("4"), PSTR("nozzle phase - (1)"));
+                                led_set(2, 1, 0);
+                                led_set(2, 0, 1);
+                                nozzle_phase = 1;
+                            } else {
+                                uart_print_key_P(PSTR("4"), PSTR("nozzle phase - (1)"));
+                            }
+                        }
+                    }
+                } else if (key_char == '5') {   // 노즐 위치 + (높은 단계로)
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (current_state == STATE_PUMP_ON || current_state == STATE_PUMP_WEAK) {
+                            start_inc_blink();
+                            if (led_get(2, 1)) {
+                                uart_print_key_P(PSTR("5"), PSTR("nozzle phase + (3)"));
+                                led_set(2, 1, 0);
+                                led_set(2, 2, 1);
+                                nozzle_phase = 3;
+                            } else if (led_get(2, 0)) {
+                                uart_print_key_P(PSTR("5"), PSTR("nozzle phase + (2)"));
+                                led_set(2, 0, 0);
+                                led_set(2, 1, 1);
+                                nozzle_phase = 2;
+                            } else {
+                                uart_print_key_P(PSTR("5"), PSTR("nozzle phase + (3)"));
+                            }
+                        }
+                    }
+                } else if (key_char == '7') {   // 수압 -
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (!dry_mode_active) {
+                            if (led_get(0, 0) && led_get(0, 1) && led_get(0, 2)) {
+                                uart_print_key_P(PSTR("7"), PSTR("water pressure - (2)"));
+                                led_set(0, 2, 0);
+                                water_pressure = 2;
+                            } else if (led_get(0, 0) && led_get(0, 1)) {
+                                uart_print_key_P(PSTR("7"), PSTR("water pressure - (1)"));
+                                led_set(0, 1, 0);
+                                water_pressure = 1;
+                            } else {
+                                uart_print_key_P(PSTR("7"), PSTR("water pressure - (1)"));
+                            }
+                        }
+                    }
+                } else if (key_char == '8') {   // 수압 +
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (!dry_mode_active) {
+                            if (led_get(0, 0) && led_get(0, 1)) {
+                                uart_print_key_P(PSTR("8"), PSTR("water pressure + (3)"));
+                                led_set(0, 2, 1);
+                                water_pressure = 3;
+                            } else if (led_get(0, 0)) {
+                                uart_print_key_P(PSTR("8"), PSTR("water pressure + (2)"));
+                                led_set(0, 1, 1);
+                                water_pressure = 2;
+                            } else {
+                                uart_print_key_P(PSTR("8"), PSTR("water pressure + (3)"));
+                            }
+                        }
+                    }
+                } else if (key_char == 'B') {   // 시트 온도 단계 순환 (시트센서와 무관하게 항상 동작)
+                    if (!dry_mode_active) {
+                        buzzer_start();
+                        if (led_get(1, 0) && led_get(1, 1) && led_get(1, 2)) {
+                            uart_print_key_P(PSTR("B"), PSTR("change seat temperature (off)"));
+                            led_set(1, 0, 0);
+                            led_set(1, 1, 0);
+                            led_set(1, 2, 0);
+                            seat_temperature = 0;
+                        } else if (led_get(1, 0) && led_get(1, 1)) {
+                            uart_print_key_P(PSTR("B"), PSTR("change seat temperature (on : 3)"));
+                            led_set(1, 2, 1);
+                            seat_temperature = 3;
+                        } else if (led_get(1, 0)) {
+                            uart_print_key_P(PSTR("B"), PSTR("change seat temperature (on : 2)"));
+                            led_set(1, 1, 1);
+                            seat_temperature = 2;
+                        } else {
+                            uart_print_key_P(PSTR("B"), PSTR("change seat temperature (on : 1)"));
+                            led_set(1, 0, 1);
+                            seat_temperature = 1;
+                        }
+                    }
+                } else if (key_char == 'A') {   // 수동 건조 시작
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (!dry_mode_active) {
+                            uart_print_key_P(PSTR("A"), PSTR("dry"));
+                            fan_on();
+                            led_set(0, 3, 1);
+                            dry_mode_active = 1;
+                            dry_mode_start_time = millis_custom();
+                        }
+                    }
+                } else if (key_char == '1') {   // 정지
+                    if (seat_sensor) {
+                        uart_print_key_P(PSTR("1"), PSTR("STOP"));
+                        stop();
+                    }
+                } else if (key_char == '2') {   // 세정(wash) 시작
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (current_state == STATE_IDLE) {
+                            uart_print_key_P(PSTR("2"), PSTR("wash start"));
+                            sequence_active = 1;
+                            current_nozzle_fwd_time  = nozzle_fwd_time_wash;
+                            current_nozzle_back_time = nozzle_back_time_wash;
+                            enter_state(STATE_NOZZLE_FORWARD);
+                        }
+                    }
+                } else if (key_char == '3') {   // 비데(bidet) 시작
+                    if (seat_sensor) {
+                        buzzer_start();
+                        if (current_state == STATE_IDLE) {
+                            uart_print_key_P(PSTR("3"), PSTR("bidet start"));
+                            sequence_active = 1;
+                            current_nozzle_fwd_time  = nozzle_fwd_time_bidet;
+                            current_nozzle_back_time = nozzle_back_time_bidet;
+                            enter_state(STATE_NOZZLE_FORWARD);
+                        }
+                    }
                 }
 
+                else if (key_char == '*') {   // 디버깅용: 현재 상태를 시리얼로 출력
+                    uart_print_key_P(PSTR("*"), PSTR("debug"));
+                    buzzer_start();
+                    debug_status();
+                }
+
+                else {   // 그 외 정의되지 않은 키는 눌린 문자만 시리얼로 출력
+                    if (!dry_mode_active && seat_sensor) {
+                        uart_transmit('[');
+                        uart_transmit(key_char);
+                        uart_transmit(']');
+                        uart_transmit('\n');
+                    }
                 }
             }
         }
-        PORTB |= (0b1111 << 2);
+        PORTB |= (0b1111 << 2);   // 이번 행 스캔 끝, 다시 모두 HIGH로 되돌림
     }
 }
 
 // -------------------------------------------------------------------------------------------
 
 // 슬라이드 스위치(시트 센서)
+// 사람이 변기에 앉으면 눌리는 스위치. 내부 풀업을 사용하므로
+// 안 눌렸을 땐 HIGH, 눌리면 LOW가 된다.
 
-uint8_t slide_switch_flag = 0;
-
+// 시트센서 핀을 입력 + 내부풀업으로 설정
 void slide_switch_init() {
     DDRD &= ~(1 << PD6);
     PORTD |= (1 << PD6);
 }
 
+// 지금 사람이 앉아있으면 1, 아니면 0을 반환
 uint8_t slide_switch_state() {
     return !(PIND & (1 << PD6));
 }
 
-uint8_t prev_slide_state = 0;
+uint8_t prev_slide_state = 0;   // 바로 이전에 읽었던 착석 상태 (변화를 감지하기 위함)
 
+// 메인 루프에서 계속 호출됨: 착석 상태가 바뀌는 "순간"을 감지해서 처리
 void handle_slide_switch() {
     uint8_t curr_state = slide_switch_state();
-    slide_switch_flag = curr_state;
-    if (curr_state && !prev_slide_state) {
-        tone_on();
-        uart_print("[SW] seat sensor on\n");
+    if (curr_state && !prev_slide_state) {        // 방금 앉았다면
+        buzzer_start();
+        uart_print_P(PSTR("[SW] seat sensor on\n"));
         seat_sensor = 1;
-    } else if (!curr_state && prev_slide_state) {
-        tone_on();
-        uart_print("[SW] seat sensor off\n");
-        stop();
+    } else if (!curr_state && prev_slide_state) {  // 방금 일어났다면
+        buzzer_start();
+        uart_print_P(PSTR("[SW] seat sensor off\n"));
+        stop();          // 안전을 위해 진행 중이던 동작을 모두 정지
         seat_sensor = 0;
     }
     prev_slide_state = curr_state;
@@ -707,63 +739,62 @@ void handle_slide_switch() {
 // -------------------------------------------------------------------------------------------
 
 // 디버깅용 함수들
+// '*' 키를 누르면 현재 설정값들을 시리얼 모니터로 출력해서 상태를 확인할 수 있게 해준다
 void debug_status() {	// 디버깅용
-    char buffer[32];
+    char buffer[32];   // snprintf로 만든 문자열을 임시로 담아두는 공간
 
-    uart_print("=== Status ===\n");
+    uart_print_P(PSTR("=== Status ===\n"));
 
-    // 수압 상태 출력
-    snprintf(buffer, sizeof(buffer), "Water Pressure: %d\n", water_pressure);
+    snprintf_P(buffer, sizeof(buffer), PSTR("Water Pressure: %d\n"), water_pressure);
     uart_print(buffer);
 
-    // 시트 온도 상태 출력
-    snprintf(buffer, sizeof(buffer), "Seat Temp: %d\n", seat_temperature);
-    uart_print(buffer);
-  
-    // 노즐 위치 상태 출력
-    snprintf(buffer, sizeof(buffer), "Nozzle Phase: %d\n", nozzle_phase);
-    uart_print(buffer);
-      
-    // 시트 센서 상태 출력
-    snprintf(buffer, sizeof(buffer), "Seat Sensor: %d\n", seat_sensor);
+    snprintf_P(buffer, sizeof(buffer), PSTR("Seat Temp: %d\n"), seat_temperature);
     uart_print(buffer);
 
-    uart_print("===============\n");
+    snprintf_P(buffer, sizeof(buffer), PSTR("Nozzle Phase: %d\n"), nozzle_phase);
+    uart_print(buffer);
+
+    snprintf_P(buffer, sizeof(buffer), PSTR("Seat Sensor: %d\n"), seat_sensor);
+    uart_print(buffer);
+
+    uart_print_P(PSTR("===============\n"));
 }						// 디버깅용
 
 // -------------------------------------------------------------------------------------------
 
 
 int main() {
+    // 각 기능별 초기화
     uart_init();
     slide_switch_init();
-    timer0_init();
-    pump_init(); 
-    DDRD  |= (1<<PD7);  
+    systick_init();     // millis_custom/micros_custom 사용 준비
+    pump_init();
+    DDRD  |= (1<<PD7);  // 노즐 후진 LED 핀 출력
     PORTD &= ~(1<<PD7);
-    DDRB  |= (1<<PB0);  
+    DDRB  |= (1<<PB0);  // 노즐 전진 LED 핀 출력
     PORTB &= ~(1<<PB0);
 
- 
+
+    // 전원을 켰을 때 이미 앉아있는 상태일 수도 있으니 초기값을 실제 센서값으로 맞춰줌
     prev_slide_state = slide_switch_state();
-    slide_switch_flag = prev_slide_state;
     seat_sensor = prev_slide_state;
-  
+
+    // 메인 루프: 아래 작업들을 계속 반복
     while(1) {
-        handle_slide_switch();
-        update_state(); 
-        update_dry_mode();
-        tone_update();
+        handle_slide_switch();      // 착석 상태 확인
+        update_state();             // 비데 시퀀스 상태 진행
+        update_dry_mode();          // 수동 건조 타이머 확인
+        buzzer_update();            // 부저 소리 재생 처리
         _delay_ms(1);
-        led_matrix_enter();
-        led_matrix_loop();
+        led_matrix_enter();         // LED 매트릭스용 핀 설정
+        led_matrix_loop();          // LED 한 행 갱신
         _delay_ms(1);
-        led_matrix_exit();
-        keypad_matrix_enter();
-        keypad_matrix_input();
-        keypad_matrix_exit();
-        blink_update(); 
-        seat_heater_blink_update();
-        
+        led_matrix_exit();          // 핀을 키패드용으로 넘기기 전 정리
+        keypad_matrix_enter();      // 키패드 매트릭스용 핀 설정
+        keypad_matrix_input();      // 키패드 스캔 및 입력 처리
+        keypad_matrix_exit();       // 핀을 LED용으로 넘기기 전 정리
+        blink_update();             // 노즐 위치 변경 LED 깜빡임 처리
+        seat_heater_blink_update(); // 시트 히터 깜빡임 처리
+
     }
-}  
+}
