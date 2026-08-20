@@ -413,11 +413,17 @@ void stop() {
 }
 
 
-// —— 펌프 초기화 (OC0B=D6, PWM으로 수압 세기를 조절) ——
+// —— 펌프 초기화 (OC0B=D5, PWM으로 수압 세기를 조절) ——
+// 처음엔 TCCR0A를 건드리지 않는다 (COM0B1 미설정) - 타이머를 OC0B 핀에서
+// 아예 분리해둔 채로 시작해서, 평범한 GPIO LOW로 꺼진 상태를 만든다.
+// (OCR0B=0으로 "0% 듀티"를 표현하는 방식은 Tinkercad 시뮬레이터가 Fast PWM의
+//  OCR0B=0 특수 케이스를 정확히 재현하지 못해 매 PWM 주기마다 짧은 펄스가 새어나가
+//  펌프 LED가 계속 깜빡이는 것처럼 보이는 문제가 있었음 -> pump_set()에서
+//  레벨 0일 때는 TCCR0A를 완전히 초기화해 핀을 타이머와 분리하고 GPIO로 강제 LOW)
 void pump_init(void) {
-    DDRD  |= (1<<PD5);                          // D6 출력
-    TCCR0A = (1<<COM0B1)|(1<<WGM01)|(1<<WGM00); // Fast PWM, 비반전
-    TCCR0B = (1<<CS01)|(1<<CS00);               // 분주비 64
+    DDRD  |= (1<<PD5);                          // D5 출력
+    PORTD &= ~(1<<PD5);                         // 시작은 확실한 GPIO LOW
+    TCCR0B = (1<<CS01)|(1<<CS00);               // 분주비 64 (핀 연결과 무관하게 타이머는 계속 동작)
 }
 
 // —— 수압 단계별 PWM 설정 ——
@@ -425,7 +431,14 @@ void pump_init(void) {
 // level: 0=꺼짐, 1=약, 2=중, 3=강
 void pump_set(uint8_t level) {
     static const uint8_t tbl[4] = {0, 64, 128, 255};   // 각 단계에 해당하는 PWM 값(0~255)
-    OCR0B = (level < 4) ? tbl[level] : 0;
+    uint8_t val = (level < 4) ? tbl[level] : 0;
+    OCR0B = val;
+    if (val == 0) {
+        TCCR0A = 0;              // OC0B를 타이머에서 완전히 분리 (일반 GPIO로 복귀)
+        PORTD &= ~(1<<PD5);      // 흔들리지 않게 확실히 LOW로 고정
+    } else {
+        TCCR0A = (1<<COM0B1)|(1<<WGM01)|(1<<WGM00); // Fast PWM, 비반전 - 다시 연결
+    }
 }
 // —— 노즐 방향 표시 LED ——
 static inline void nozzle_led_forward(void) {
