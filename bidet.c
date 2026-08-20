@@ -19,7 +19,10 @@ typedef enum {
 
 volatile BidetState current_state = STATE_IDLE;  // 지금 어떤 단계인지
 volatile uint32_t state_start_time = 0;          // 현재 단계에 들어온 시각(ms) - 경과시간 계산용
-void enter_state(BidetState s);   // 상태를 바꿔주는 함수 (아래에서 정의)
+void enter_state(uint8_t s);      // 상태를 바꿔주는 함수 (아래에서 정의) - Tinkercad/Arduino IDE가 자동으로
+                                   // 만드는 함수 원형이 파일 맨 위(#include 직후, BidetState 정의보다 앞)에
+                                   // 끼워들어가기 때문에 매개변수를 BidetState로 두면 "BidetState was not
+                                   // declared in this scope" 에러가 남 -> uint8_t로 우회
 void update_state(void);          // 매 루프마다 상태를 갱신하는 함수 (아래에서 정의)
 
 // 아래쪽에서 정의되지만 더 앞에서 쓰이므로 전방 선언(원형만 미리 알려줌) 필요
@@ -484,8 +487,8 @@ void seat_heater_blink_update() {
 }
 
 // 상태를 s로 바꾸고, 그 상태에 처음 들어갈 때 한 번만 해야 할 초기화 작업을 수행
-void enter_state(BidetState s) {
-    current_state = s;
+void enter_state(uint8_t s) {
+    current_state = (BidetState)s;
     state_start_time = millis_custom();   // 경과시간을 0부터 다시 재기 시작
     switch(s) {
       case STATE_IDLE:      // 대기: 모든 동작 정지
